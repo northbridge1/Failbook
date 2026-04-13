@@ -1,0 +1,9 @@
+## Interface: 30300
+## Title: Failbook
+## Notes: Lista negra de jugadores para raids (3.3.5a)
+## Author: Northbridge
+## Version: 2.0
+## SavedVariables: FailbookDB
+
+Failbook.lua
+Failbook_UI.lua
