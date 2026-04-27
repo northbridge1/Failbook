@@ -1,4 +1,4 @@
--- Failbook.lua (3.3.5a) - v2.0
+-- Failbook.lua (3.3.5a) - v1.0
 
 local ADDON = "Failbook"
 FailbookDB = FailbookDB or {}
@@ -217,6 +217,7 @@ local function IsRecordArchived(rec)
 end
 
 local EnsurePairing
+local InferClusterCreatedAt
 EnsurePairing = function()
   if type(FailbookDB.pairing) ~= "table" then FailbookDB.pairing = {} end
   local P = FailbookDB.pairing
@@ -265,9 +266,10 @@ local function EnsureDB()
   if type(FailbookDB) ~= "table" then FailbookDB = {} end
   if type(FailbookDB.players) ~= "table" then FailbookDB.players = {} end
   if type(FailbookDB.settings) ~= "table" then
-    FailbookDB.settings = { alertRW = true, alertChat = true, alertSound = true, leaderOnly = false, clusterKey = "" }
+    FailbookDB.settings = { alertRW = true, alertChat = true, alertSound = true, leaderOnly = false, clusterKey = "", clusterCreatedAt = 0 }
   end
   if FailbookDB.settings.clusterKey == nil then FailbookDB.settings.clusterKey = "" end
+  if FailbookDB.settings.clusterCreatedAt == nil then FailbookDB.settings.clusterCreatedAt = 0 end
   if type(FailbookDB.syncTargets) ~= "table" then FailbookDB.syncTargets = {} end
   EnsurePairing()
 
@@ -300,6 +302,49 @@ local function EnsureDB()
   end
 
   FailbookDB._clock = FixTs(FailbookDB._clock)
+  FailbookDB.settings.clusterCreatedAt = FixTs(FailbookDB.settings.clusterCreatedAt)
+
+  local clusterKey = tostring(FailbookDB.settings.clusterKey or "")
+  clusterKey = clusterKey:gsub("^%s+", ""):gsub("%s+$", "")
+  FailbookDB.settings.clusterKey = clusterKey
+
+  if clusterKey == "" then
+    FailbookDB.settings.clusterCreatedAt = 0
+  elseif (tonumber(FailbookDB.settings.clusterCreatedAt or 0) or 0) <= 0 then
+    FailbookDB.settings.clusterCreatedAt = InferClusterCreatedAt()
+  end
+end
+
+InferClusterCreatedAt = function()
+  local earliest = 0
+  local function Consider(v)
+    v = tonumber(v or 0) or 0
+    if v > 0 and (earliest == 0 or v < earliest) then earliest = v end
+  end
+
+  if type(FailbookDB) == "table" then
+    Consider(FailbookDB._clock)
+
+    if type(FailbookDB.players) == "table" then
+      for _, rec in pairs(FailbookDB.players) do
+        if type(rec) == "table" then
+          Consider(rec.updatedAt)
+          Consider(rec.deletedAt)
+        end
+      end
+    end
+
+    if type(FailbookDB.pairing) == "table" and type(FailbookDB.pairing.lastSync) == "table" then
+      for _, bucket in pairs(FailbookDB.pairing.lastSync) do
+        if type(bucket) == "table" then
+          for _, ts in pairs(bucket) do Consider(ts) end
+        end
+      end
+    end
+  end
+
+  if earliest > 0 then return earliest end
+  return CurrentStamp()
 end
 
 local function PurgeOldDeletedRecords()
@@ -340,10 +385,44 @@ local function GetClusterKey()
   return NormalizeClusterKey(FailbookDB.settings.clusterKey or "")
 end
 
+local function GetClusterCreatedAt()
+  EnsureDB()
+  local key = NormalizeClusterKey(FailbookDB.settings.clusterKey or "")
+  if key == "" then return 0 end
+  return tonumber(FailbookDB.settings.clusterCreatedAt or 0) or 0
+end
+
+local RefreshAllPairKeys
+
+local function SetClusterIdentity(key, createdAt)
+  EnsureDB()
+  key = NormalizeClusterKey(key)
+  local oldKey = NormalizeClusterKey(FailbookDB.settings.clusterKey or "")
+  local oldCreatedAt = tonumber(FailbookDB.settings.clusterCreatedAt or 0) or 0
+  if key == "" then
+    FailbookDB.settings.clusterKey = ""
+    FailbookDB.settings.clusterCreatedAt = 0
+    return false
+  end
+  createdAt = tonumber(createdAt or 0) or 0
+  if createdAt <= 0 then createdAt = CurrentStamp() end
+  FailbookDB.settings.clusterKey = key
+  FailbookDB.settings.clusterCreatedAt = createdAt
+  if oldKey ~= key and RefreshAllPairKeys then
+    RefreshAllPairKeys()
+  elseif oldKey == key and oldCreatedAt <= 0 and createdAt > 0 and RefreshAllPairKeys then
+    RefreshAllPairKeys()
+  end
+  return true
+end
+
 local function EnsureClusterKey()
   EnsureDB()
   local cur = GetClusterKey()
-  if cur ~= "" then return cur end
+  if cur ~= "" then
+    if GetClusterCreatedAt() <= 0 then SetClusterIdentity(cur, InferClusterCreatedAt()) end
+    return cur
+  end
   local chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
   local t = {}
   for i = 1, 24 do
@@ -351,8 +430,76 @@ local function EnsureClusterKey()
     t[i] = string.sub(chars, idx, idx)
   end
   cur = table.concat(t)
-  FailbookDB.settings.clusterKey = cur
+  SetClusterIdentity(cur, NowEpoch())
   return cur
+end
+
+local IsPaired
+local SendToTarget
+
+local function DoesRemoteClusterWin(localKey, localCreatedAt, remoteKey, remoteCreatedAt)
+  localKey = NormalizeClusterKey(localKey)
+  remoteKey = NormalizeClusterKey(remoteKey)
+  localCreatedAt = tonumber(localCreatedAt or 0) or 0
+  remoteCreatedAt = tonumber(remoteCreatedAt or 0) or 0
+
+  if remoteKey == "" then return false end
+  if localKey == "" then return true end
+  if localKey == remoteKey then
+    if localCreatedAt <= 0 and remoteCreatedAt > 0 then return true end
+    if remoteCreatedAt > 0 and localCreatedAt > 0 and remoteCreatedAt < localCreatedAt then return true end
+    return false
+  end
+  if remoteCreatedAt > 0 and localCreatedAt > 0 then
+    if remoteCreatedAt < localCreatedAt then return true end
+    if remoteCreatedAt > localCreatedAt then return false end
+  elseif remoteCreatedAt > 0 and localCreatedAt <= 0 then
+    return true
+  elseif remoteCreatedAt <= 0 and localCreatedAt > 0 then
+    return false
+  end
+  return tostring(remoteKey) < tostring(localKey)
+end
+
+local function SendClusterCorrection(targetKey, clusterKey, clusterCreatedAt)
+  if not targetKey or targetKey == "" then return end
+  clusterKey = NormalizeClusterKey(clusterKey)
+  clusterCreatedAt = tonumber(clusterCreatedAt or 0) or 0
+  if clusterKey == "" or clusterCreatedAt <= 0 then return end
+  SendToTarget(targetKey, "CU	" .. clusterKey .. "	" .. tostring(clusterCreatedAt))
+end
+
+local function MaybeResolveClusterConflict(senderKey, remoteCluster, remoteCreatedAt, source)
+  remoteCluster = NormalizeClusterKey(remoteCluster)
+  remoteCreatedAt = tonumber(remoteCreatedAt or 0) or 0
+  if remoteCluster == "" then return false end
+
+  local localCluster = GetClusterKey()
+  local localCreatedAt = GetClusterCreatedAt()
+
+  if localCluster == "" then
+    SetClusterIdentity(remoteCluster, remoteCreatedAt)
+    if FailbookUI and FailbookUI.Refresh then FailbookUI:Refresh() end
+    return true
+  end
+
+  if localCluster == remoteCluster then
+    if remoteCreatedAt > 0 and (localCreatedAt <= 0 or remoteCreatedAt < localCreatedAt) then
+      FailbookDB.settings.clusterCreatedAt = remoteCreatedAt
+    end
+    return false
+  end
+
+  if DoesRemoteClusterWin(localCluster, localCreatedAt, remoteCluster, remoteCreatedAt) then
+    SetClusterIdentity(remoteCluster, remoteCreatedAt)
+    if FailbookUI and FailbookUI.Refresh then FailbookUI:Refresh() end
+    return true
+  end
+
+  if source ~= "correction" and IsPaired(senderKey) then
+    SendClusterCorrection(senderKey, localCluster, localCreatedAt)
+  end
+  return false
 end
 
 local function IsTargetListed(nameKey)
@@ -369,7 +516,7 @@ local function GetPair(remoteKey)
   return (P.pairs[selfKey] and P.pairs[selfKey][remoteKey]) or nil
 end
 
-local function IsPaired(remoteKey)
+IsPaired = function(remoteKey)
   local p = GetPair(remoteKey)
   return p and p.key
 end
@@ -394,6 +541,24 @@ local function MakeClusterPairKey(remoteKey)
   local a, b = selfKey, remoteKey or ""
   if a > b then a, b = b, a end
   return "CK" .. Hash32("PAIR:" .. ck .. ":" .. a .. ":" .. b)
+end
+
+RefreshAllPairKeys = function()
+  local cluster = GetClusterKey()
+  if cluster == "" then return end
+  local P, selfKey = EnsurePairing()
+  local bucket = P.pairs[selfKey]
+  if type(bucket) ~= "table" then return end
+  for remoteKey, pair in pairs(bucket) do
+    local pairKey = MakeClusterPairKey(remoteKey)
+    if pairKey and pairKey ~= "" then
+      if type(pair) ~= "table" then
+        bucket[remoteKey] = { key = pairKey }
+      else
+        pair.key = pairKey
+      end
+    end
+  end
 end
 
 local function IsInRaid()
@@ -543,6 +708,7 @@ end
 local MSG_PR = "PR"
 local MSG_PA = "PA"
 local MSG_PD = "PD"
+local MSG_CU = "CU"
 
 local function RandomKey(len)
   local chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -646,7 +812,7 @@ local function DecryptFrom(senderKey, b64)
   return Crypt(pk.key, bytes, true)
 end
 
-local function SendToTarget(target, msg)
+SendToTarget = function(target, msg)
   if not target or target == "" then return end
   if SendAddonMessage then SendAddonMessage(PREFIX, msg, "WHISPER", target) end
 end
@@ -679,15 +845,16 @@ local function SetupPairPopup()
       EnsureDB()
       local P, selfKey = EnsurePairing()
       local sKey = MakeKey(data.sender) or data.sender
-      local key = RandomKey(18)
       local cluster = EnsureClusterKey()
+      local clusterCreatedAt = GetClusterCreatedAt()
+      local key = MakeClusterPairKey(sKey) or RandomKey(18)
       P.pairs[selfKey][sKey] = { key = key }
       P.lastSync[selfKey][sKey] = 0
       P.pendingIn[selfKey][sKey] = nil
       local exists = false
       for _, t in ipairs(FailbookDB.syncTargets) do if t == sKey then exists = true break end end
       if not exists then table.insert(FailbookDB.syncTargets, sKey) end
-      SendToTarget(data.sender, MSG_PA .. "\t" .. data.nonce .. "\t" .. key .. "\t" .. cluster)
+      SendToTarget(data.sender, MSG_PA .. "\t" .. data.nonce .. "\t" .. key .. "\t" .. cluster .. "\t" .. tostring(clusterCreatedAt))
       SyncSingleTarget(sKey, "pair_accept")
       DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99[Failbook]|r " .. T("PAIRED_WITH", sKey))
       if FailbookUI and FailbookUI.Refresh then FailbookUI:Refresh() end
@@ -816,7 +983,9 @@ SyncSingleTarget = function(targetKey, reason)
   if not targetKey or targetKey == "" then return end
   if not IsPaired(targetKey) then return end
   local syncId = tostring(time()) .. "-" .. tostring(random(1000, 9999))
-  Enqueue(targetKey, "S\t" .. syncId .. "\t" .. EscapeField(reason or ""))
+  local cluster = GetClusterKey()
+  local clusterCreatedAt = GetClusterCreatedAt()
+  Enqueue(targetKey, "S\t" .. syncId .. "\t" .. EscapeField(reason or "") .. "\t" .. cluster .. "\t" .. tostring(clusterCreatedAt))
   for name, data in pairs(FailbookDB.players) do
     if type(data) == "table" then
       local up = tonumber(data.updatedAt or 0) or 0
@@ -860,7 +1029,14 @@ function Failbook:NormalizeName(name) return MakeKey(name) end
 
 function Failbook:SetClusterKey(key)
   EnsureDB()
-  FailbookDB.settings.clusterKey = NormalizeClusterKey(key)
+  key = NormalizeClusterKey(key)
+  if key == "" then
+    SetClusterIdentity("", 0)
+  elseif key == GetClusterKey() and GetClusterCreatedAt() > 0 then
+    -- mantener timestamp existente
+  else
+    SetClusterIdentity(key, NowEpoch())
+  end
   return true
 end
 
@@ -1020,6 +1196,7 @@ f:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
     EnsureDB()
     MigrateOldKeys()
     PurgeOldDeletedRecords()
+    if GetClusterKey() ~= "" then RefreshAllPairKeys() end
     RegisterPrefix()
     SetupPairPopup()
     if FailbookDB.settings then FailbookDB.settings.leaderOnly = false end
@@ -1050,7 +1227,25 @@ f:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
     if kind == MSG_PR then
       local _, nonce, sig = msg:match("^(%S+)\t(%S+)\t?(.*)$")
       if not nonce then return end
-      if IsPaired(senderKey) then return end
+      if IsPaired(senderKey) then
+        local pairKey = MakeClusterPairKey(senderKey)
+        if pairKey and pairKey ~= "" then
+          P.pairs[selfKey][senderKey] = P.pairs[selfKey][senderKey] or {}
+          P.pairs[selfKey][senderKey].key = pairKey
+        else
+          local curPair = GetPair(senderKey)
+          pairKey = curPair and curPair.key or nil
+        end
+        local exists = false
+        for _, t in ipairs(FailbookDB.syncTargets) do if t == senderKey then exists = true break end end
+        if not exists then table.insert(FailbookDB.syncTargets, senderKey) end
+        if pairKey and pairKey ~= "" then
+          SendToTarget(sender, MSG_PA .. "\t" .. nonce .. "\t" .. pairKey .. "\t" .. GetClusterKey() .. "\t" .. tostring(GetClusterCreatedAt()))
+          SyncSingleTarget(senderKey, "pair_repair")
+        end
+        if FailbookUI and FailbookUI.Refresh then FailbookUI:Refresh() end
+        return
+      end
       local ckey = GetClusterKey()
       if ckey ~= "" and IsTargetListed(senderKey) then
         local expected = MakeAutoSig(nonce, senderKey, ckey)
@@ -1063,7 +1258,7 @@ f:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
             local exists = false
             for _, t in ipairs(FailbookDB.syncTargets) do if t == senderKey then exists = true break end end
             if not exists then table.insert(FailbookDB.syncTargets, senderKey) end
-            SendToTarget(sender, MSG_PA .. "\t" .. nonce .. "\t" .. pairKey .. "\t" .. ckey)
+            SendToTarget(sender, MSG_PA .. "\t" .. nonce .. "\t" .. pairKey .. "\t" .. ckey .. "\t" .. tostring(GetClusterCreatedAt()))
             SyncSingleTarget(senderKey, "pair_auto")
             DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99[Failbook]|r " .. T("PAIR_AUTO", senderKey))
             if FailbookUI and FailbookUI.Refresh then FailbookUI:Refresh() end
@@ -1078,7 +1273,7 @@ f:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
       return
 
     elseif kind == MSG_PA then
-      local _, nonce, key, cluster = msg:match("^(%S+)\t(%S+)\t([^\t]+)\t?(.*)$")
+      local _, nonce, key, cluster, clusterCreatedAt = msg:match("^(%S+)	(%S+)	([^	]+)	([^	]*)	?(%d*)$")
       if not nonce or not key then return end
       local pending = P.pendingOut[selfKey][senderKey]
       if not pending or pending ~= nonce then return end
@@ -1086,7 +1281,20 @@ f:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
       P.pairs[selfKey][senderKey] = { key = key }
       P.lastSync[selfKey][senderKey] = 0
       cluster = NormalizeClusterKey(cluster)
-      if cluster ~= "" and GetClusterKey() == "" then FailbookDB.settings.clusterKey = cluster end
+      clusterCreatedAt = tonumber(clusterCreatedAt or 0) or 0
+      if cluster ~= "" then
+        if GetClusterKey() == "" then
+          SetClusterIdentity(cluster, clusterCreatedAt)
+        else
+          MaybeResolveClusterConflict(senderKey, cluster, clusterCreatedAt, "pair_accept")
+        end
+        if GetClusterKey() == cluster then
+          local pairKey = MakeClusterPairKey(senderKey)
+          if pairKey and pairKey ~= "" then
+            P.pairs[selfKey][senderKey].key = pairKey
+          end
+        end
+      end
       local exists = false
       for _, t in ipairs(FailbookDB.syncTargets) do if t == senderKey then exists = true break end end
       if not exists then table.insert(FailbookDB.syncTargets, senderKey) end
@@ -1096,7 +1304,7 @@ f:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
       return
 
     elseif kind == MSG_PD then
-      local _, nonce = msg:match("^(%S+)\t(%S+)$")
+      local _, nonce = msg:match("^(%S+)	(%S+)$")
       if not nonce then return end
       local pending = P.pendingOut[selfKey][senderKey]
       if pending and pending == nonce then
@@ -1105,13 +1313,29 @@ f:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         if FailbookUI and FailbookUI.Refresh then FailbookUI:Refresh() end
       end
       return
+
+    elseif kind == MSG_CU then
+      if not IsPaired(senderKey) then return end
+      local _, cluster, clusterCreatedAt = msg:match("^(%S+)	([^	]+)	(%d+)$")
+      if not cluster or not clusterCreatedAt then return end
+      MaybeResolveClusterConflict(senderKey, cluster, clusterCreatedAt, "correction")
+      return
     end
 
     if not IsPaired(senderKey) then return end
 
     if kind == "S" then
-      local _, sid = msg:match("^(%S+)\t(%S+)")
+      local _, sid, _, cluster, clusterCreatedAt = msg:match("^(%S+)	(%S+)	([^	]*)	([^	]*)	?(%d*)$")
       if not sid then return end
+      cluster = NormalizeClusterKey(cluster)
+      clusterCreatedAt = tonumber(clusterCreatedAt or 0) or 0
+      if cluster ~= "" then
+        if GetClusterKey() == "" then
+          SetClusterIdentity(cluster, clusterCreatedAt)
+        else
+          MaybeResolveClusterConflict(senderKey, cluster, clusterCreatedAt, "sync_start")
+        end
+      end
       incoming[senderKey] = { id = sid, players = {}, chunks = {} }
 
     elseif kind == "B" then
@@ -1178,10 +1402,10 @@ SlashCmdList["FAILBOOK"] = function(msg)
         DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99[Failbook]|r " .. T("CLUSTER_SET"))
       end
     elseif sub == "clear" or sub == "off" then
-      FailbookDB.settings.clusterKey = ""
+      SetClusterIdentity("", 0)
       DEFAULT_CHAT_FRAME:AddMessage("|cffffcc00[Failbook]|r " .. T("CLUSTER_CLEARED"))
     else
-      FailbookDB.settings.clusterKey = sub
+      SetClusterIdentity(sub, NowEpoch())
       DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99[Failbook]|r " .. T("CLUSTER_SAVED"))
     end
   elseif cmd == "show" or cmd == "" then

@@ -2,8 +2,8 @@
 ## Title: Failbook
 ## Notes: Lista negra de jugadores para raids (3.3.5a)
 ## Author: Northbridge
-## Version: 2.0
-## SavedVariables: FailbookDB
+## Version: 1.0
+
 
 Failbook.lua
 Failbook_UI.lua

@@ -1,4 +1,5 @@
--- Failbook_UI.lua (3.3.5a) - v2.0
+-- Failbook_UI.lua (3.3.5a) - v1.0
+
 
 FailbookUI = {}
 
